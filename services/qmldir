@@ -1,3 +1,4 @@
 module services
 
 singleton TimeService 1.0 Time.qml
+singleton MprisService 1.0 MprisTiki.qml
