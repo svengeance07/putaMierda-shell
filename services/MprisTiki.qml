@@ -2,8 +2,10 @@ pragma Singleton
 
 import Quickshell
 import Quickshell.Services.Mpris
+import Quickshell.Services.Pipewire
 import Quickshell.Io
 import QtQuick
+import QtQml.Models
 
 Scope {
     id: root;
@@ -24,6 +26,20 @@ Scope {
         root.syncPlayerLists();
     }
 
+    Connections {
+        target: YtMusic
+        function onMpvPlayerChanged(){
+            root._updateMpvCache();
+            root._rebuildPlayerList();
+        }
+        function onCurrentVideoIdChanged(){
+            root._rebuildPlayerList();
+        }
+        function onCurrentTitleChanged(){
+            root._rebuildPlayerList();
+        }
+    }
+
     Timer {
         id: _rebuildDebounce
         interval: 50
@@ -36,6 +52,47 @@ Scope {
         interval: 1800
         repeat: false
         onTriggered: root._doRebuildPlayerList(true)
+    }
+
+    Timer {
+        id: _streamMetadataRefresh
+        interval: 120
+        repeat: false
+        onTriggered: {
+            if (!_streamMetadataProc.running) {
+                _streamMetadataProc.running = true
+            }
+        }
+    }
+
+    Process {
+        id: _streamMetadataProc
+        command: ["pw-dump"]
+        stdout: StdioCollector { id: _streamMetadataCollector }
+        onExited: (exitCode, _exitStatus) => {
+            if (exitCode !== 0) return
+            try{
+                const data = JSON.parse(_streamMetadataCollector.text ?? "[]")
+                const next = {}
+                for (const item of data) {
+                    if (item?.type !== "PipeWire:Interface:Node") continue
+                    const props = item?.info?.props ?? {}
+                    if (props["media.class"] !== "Stream/Output/Audio") continue
+                    const id = Number(item?.id ?? 0);
+                    if (!Number.isFinite(id) || id <= 0) continue
+                    next[id] = {
+                        appName: props["application.name"] ?? "",
+                        appId: props["application.id"] ?? "",
+                        binary: props["application.process.binary"] ?? "",
+                        nodeName: props["node.name"] ?? "",
+                        mediaName: props["media.name"] ?? ""
+                    }
+                }
+                root._streamMetadataById = next
+            } catch (e) {
+                console.warn("[MprisController] Failed to parse PipeWire stream metadata: ", e)
+            }
+        }
     }
 
     function _rebuildPlayerList(): void {
@@ -80,7 +137,62 @@ Scope {
     }
 
     function isRealPlayer(player) {
-        
+        const name = player?.dbusName ?? "";
+        if (!name) return false;
+
+        const rawUrl = player?.metadata?.["xesam:url"] ?? "";
+        const lowerUrl = rawUrl.toLowerCase();
+        const lowerTitle = (player?.trackTitle ?? "").toLowerCase();
+        const lowerAlbum = (player?.trackAlbum ?? "").toLowerCase();
+
+        if (root._isBrowserPlayer(player) && root._isYoutubeUrl(rawUrl) && root._extractYoutubeVideoId(rawUrl).length === 0) {
+            return false;
+        }
+
+        if (lowerUrl.includes("x.com") || lowerUrl.includes("twitter.com") 
+            || lowerTitle.includes("x.com") || lowerTitle.includes("twitter.com")
+            || lowerAlbum.includes ("x.com") || lowerAlbum.includes("twitter.com")) {
+                return false;
+            }
+
+        const isBrowserPlayerName = name.includes("firefox") || name.includes("chrome") || name.includes("chromium") ||
+        name.includes("brave") || name.includes("vivaldi") || name.includes("opera");
+        if (isBrowserPlayerName) {
+            if (lowerTitle.includes("on x:") || lowerTitle.includes("/ x")) {
+                return false;
+            }
+        }
+
+        if (name === "org.mpris.MediaPlayer2.mpv" || name.startsWith('org.mpris.MediaPlayer2.mpv.instance')) {
+            if (YtMusic.mpvPlayer) return player === YtMusic.mpvPlayer;
+            if (name === "org.mpris.MediaPlayer2.mpv" && _mpvInstanceCache.hasMpvInstance) return false;
+            if (name.startsWith('org.mpris.MediaPlayer2.mpv.instance')) {
+                const hasAnyMeta = !!(player.trackTitle || player.trackArtist || (player.metadata?.["xesam:url"] ?? ""));
+                if (_mpvInstanceCache.hasMpvBase && !player.isPlaying && !hasAnyMeta) return false;
+            }
+        }
+
+        if (name.startsWith("org.mpris.MediaPlayer2.playerctld")) return false;
+
+        if (name.endsWith('.mpd') && !name.endsWith('MediaPlayer2.mpd')) return false;
+
+
+    }
+
+    function _updateMpvCache() {
+        let hasMpvInstance = false;
+        let hasMpvBase = false;
+        for (const p of Mpris.players.values) {
+            const name = p?.dbusName ?? "";
+            if (name.startsWith("org.mpris.MediaPlayer2.mpv.instance")) hasMpvInstance = true;
+            if (name === "org.mpris.MediaPlayer2.mpv") hasMpvBase = true;
+        }
+        _mpvInstanceCache = {hasMpvInstance, hasMpvBase};
+    }
+
+    function _isYoutubeUrl(url): bool {
+        const  value = (url ?? "").toString().toLowerCase();
+        return value.includes("youtube.com") || value.includes("youtu.be");
     }
 
     property MprisPlayer trackedPlayer: null;
@@ -91,6 +203,19 @@ Scope {
 
     property bool __reverse: false;
     property var activeTrack;
+
+    property var _streamMetadataById: {if (name === "org.mpris.MediaPlayer2.mpv" || name.startsWith("org.mpris.MediaPlayer2.mpv.instance")) {
+			if (YtMusic.mpvPlayer) return player === YtMusic.mpvPlayer;
+			// Use cached values instead of iterating
+			if (name === "org.mpris.MediaPlayer2.mpv" && _mpvInstanceCache.hasMpvInstance) return false;
+			// Drop ghost mpv.instance entries when base mpv exists
+			if (name.startsWith("org.mpris.MediaPlayer2.mpv.instance")) {
+				const hasAnyMeta = !!(player.trackTitle || player.trackArtist || (player.metadata?.["xesam:url"] ?? ""));
+				if (_mpvInstanceCache.hasMpvBase && !player.isPlaying && !hasAnyMeta) return false;
+			}
+		}}
+
+    property var _mpvInstanceCache: ({ hasMpvInstance: false, hasMpvBase: false});
 
     signal trackChanged(reverse: bool);
 
